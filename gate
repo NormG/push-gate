@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# =============================================================================
+# gate — pre-push consistency gate
+#
+# A project-agnostic tool that keeps version numbers in sync, enforces code
+# formatting, and blocks pushes that fail compile or lint checks.
+#
+# Usage:
+#   gate check   [PROJECTDIR]   dry-run: report what is out of sync
+#   gate fix     [PROJECTDIR]   apply auto-fixable changes (fmt + version sync)
+#   gate run     [PROJECTDIR]   fix + check; used by the pre-push hook
+#   gate install PROJECTDIR     scaffold .gate.conf and .githooks/pre-push
+#
+# Each project has a .gate.conf in its root that defines what to check.
+# See .gate.conf.example for the full schema.
+# =============================================================================
+set -euo pipefail
+
+GATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Colour helpers ─────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    _G='\033[1;32m'; _Y='\033[1;33m'; _R='\033[1;31m'; _B='\033[1;34m'; _X='\033[0m'
+else
+    _G=''; _Y=''; _R=''; _B=''; _X=''
+fi
+ok()     { printf "${_G}  ✓  ${_X}%s\n"  "$*"; }
+warn()   { printf "${_Y}  ~  ${_X}%s\n"  "$*"; }
+fixed()  { printf "${_B}  ✎  ${_X}%s\n"  "$*"; }
+fail()   { printf "${_R}  ✗  ${_X}%s\n"  "$*" >&2; }
+banner() { printf "\n${_B}── %s ──${_X}\n" "$*"; }
+die()    { fail "$*"; exit 1; }
+
+# ── Locate the project directory and load its config ──────────────────────────
+locate_project() {
+    local dir="${1:-$(pwd)}"
+    # Walk up from dir looking for .gate.conf
+    local cur
+    cur="$(cd "${dir}" && pwd)"
+    while [[ "${cur}" != "/" ]]; do
+        if [[ -f "${cur}/.gate.conf" ]]; then
+            echo "${cur}"
+            return 0
+        fi
+        cur="$(dirname "${cur}")"
+    done
+    die "No .gate.conf found at or above '${dir}'.  Run: gate install <projectdir>"
+}
+
+load_config() {
+    local project="$1"
+    GATE_VERSION_SOURCE=""
+    GATE_VERSION_REGEX="^version\s*=\s*\"(.+)\""
+    GATE_SYNC=()
+    GATE_AUTO_FIX=()
+    GATE_MUST_PASS=()
+    # shellcheck source=/dev/null
+    source "${project}/.gate.conf"
+    [[ -n "${GATE_VERSION_SOURCE}" ]] \
+        || die ".gate.conf must define GATE_VERSION_SOURCE"
+}
+
+read_version() {
+    local project="$1"
+    local src="${project}/${GATE_VERSION_SOURCE}"
+    [[ -f "${src}" ]] || die "Version source file not found: ${src}"
+    local ver
+    ver=$(grep -m1 -E "${GATE_VERSION_REGEX}" "${src}" \
+          | sed -E "s/${GATE_VERSION_REGEX}/\1/")
+    [[ -n "${ver}" ]] || die "Could not extract version from ${src}"
+    echo "${ver}"
+}
+
+# ── cmd_check: dry-run, report only ───────────────────────────────────────────
+cmd_check() {
+    local project
+    project="$(locate_project "${1:-$(pwd)}")"
+    load_config "${project}"
+    local version
+    version="$(read_version "${project}")"
+
+    banner "gate check — ${project}"
+    printf "  Version: ${_G}${version}${_X}  (from ${GATE_VERSION_SOURCE})\n"
+
+    local any_issue=0
+
+    # Version sync
+    if [[ ${#GATE_SYNC[@]} -gt 0 ]]; then
+        banner "Version sync"
+        for entry in "${GATE_SYNC[@]}"; do
+            IFS=':' read -r file match replacement <<< "${entry}"
+            local filepath="${project}/${file}"
+            [[ -f "${filepath}" ]] || { warn "${file}: not found (skipping)"; continue; }
+            # Substitute {VERSION} placeholder in replacement
+            local rep="${replacement/\{VERSION\}/${version}}"
+            if grep -qE "${match/\{VERSION\}/${version}}" "${filepath}"; then
+                ok "${file} — in sync"
+            else
+                warn "${file} — OUT OF SYNC (expected match: ${match/\{VERSION\}/${version}})"
+                any_issue=1
+            fi
+        done
+    fi
+
+    # Formatting (dry-run only — never modify the working tree)
+    if [[ ${#GATE_AUTO_FIX[@]} -gt 0 ]]; then
+        banner "Formatting (dry-run)"
+        local old_dir="$PWD"
+        cd "${project}"
+        for cmd in "${GATE_AUTO_FIX[@]}"; do
+            # Use --check variant; if not supported the command is skipped here
+            # (gate fix will catch it when AUTO_FIX=1).
+            if ${cmd} --check &>/dev/null 2>&1; then
+                ok "${cmd} — clean"
+            else
+                warn "${cmd} — would make changes (run: gate fix)"
+                any_issue=1
+            fi
+            # NOTE: we never run the command without --check here and never
+            # touch the working tree, so uncommitted changes are preserved.
+        done
+        cd "${old_dir}"
+    fi
+
+    # Must-pass checks
+    if [[ ${#GATE_MUST_PASS[@]} -gt 0 ]]; then
+        banner "Required checks"
+        local old_dir="$PWD"
+        cd "${project}"
+        for cmd in "${GATE_MUST_PASS[@]}"; do
+            local out
+            if out=$(${cmd} 2>&1) && [[ -z "${out}" ]]; then
+                ok "${cmd}"
+            else
+                fail "${cmd} — FAILED"
+                [[ -n "${out}" ]] && printf '%s\n' "${out}" | head -20 >&2
+                any_issue=1
+            fi
+        done
+        cd "${old_dir}"
+    fi
+
+    [[ "${any_issue}" == "0" ]] && { ok "All checks passed."; return 0; }
+    warn "Issues found. Run: gate fix ${project}"
+    return 1
+}
+
+# ── cmd_fix: apply auto-fixable changes ───────────────────────────────────────
+cmd_fix() {
+    local project
+    project="$(locate_project "${1:-$(pwd)}")"
+    load_config "${project}"
+    local version
+    version="$(read_version "${project}")"
+
+    banner "gate fix — ${project}"
+    printf "  Version: ${_G}${version}${_X}\n"
+
+    local changed=0
+
+    # Version sync
+    if [[ ${#GATE_SYNC[@]} -gt 0 ]]; then
+        banner "Version sync"
+        for entry in "${GATE_SYNC[@]}"; do
+            IFS=':' read -r file match replacement <<< "${entry}"
+            local filepath="${project}/${file}"
+            [[ -f "${filepath}" ]] || { warn "${file}: not found (skipping)"; continue; }
+            local match_v="${match/\{VERSION\}/${version}}"
+            local rep_v="${replacement/\{VERSION\}/${version}}"
+            if grep -qE "${match_v}" "${filepath}"; then
+                ok "${file} — already in sync"
+            else
+                # Apply: replace lines matching the base pattern with the versioned replacement
+                local base_match="${match//\{VERSION\}/[0-9][^ \"]*}"
+                sed -i -E "s|${base_match}|${rep_v}|" "${filepath}"
+                fixed "${file} — updated"
+                changed=1
+            fi
+        done
+    fi
+
+    # Auto-fix commands (e.g. cargo fmt)
+    if [[ ${#GATE_AUTO_FIX[@]} -gt 0 ]]; then
+        banner "Auto-fix commands"
+        local old_dir="$PWD"
+        cd "${project}"
+        for cmd in "${GATE_AUTO_FIX[@]}"; do
+            ${cmd}
+            if ! git diff --quiet; then
+                fixed "${cmd} — applied formatting changes"
+                changed=1
+            else
+                ok "${cmd} — nothing to change"
+            fi
+        done
+        cd "${old_dir}"
+    fi
+
+    if [[ "${changed}" == "1" ]]; then
+        warn "Files were modified. Review with: git diff"
+        return 1   # signal caller that commits may be needed
+    fi
+    ok "Nothing to fix."
+    return 0
+}
+
+# ── cmd_run: fix + must-pass; used by the pre-push hook ───────────────────────
+cmd_run() {
+    local project
+    project="$(locate_project "${1:-$(pwd)}")"
+    load_config "${project}"
+
+    local auto_fixed=0
+    local hard_fail=0
+
+    # Phase 1: auto-fix
+    cmd_fix "${project}" || auto_fixed=1
+
+    # Phase 2: must-pass
+    if [[ ${#GATE_MUST_PASS[@]} -gt 0 ]]; then
+        banner "Must-pass checks"
+        local old_dir="$PWD"
+        cd "${project}"
+        for cmd in "${GATE_MUST_PASS[@]}"; do
+            local out
+            if out=$(${cmd} 2>&1) && [[ -z "${out}" ]]; then
+                ok "${cmd}"
+            else
+                fail "${cmd} — FAILED"
+                [[ -n "${out}" ]] && printf '%s\n' "${out}" >&2
+                hard_fail=1
+            fi
+        done
+        cd "${old_dir}"
+    fi
+
+    if [[ "${hard_fail}" == "1" ]]; then
+        fail "Hard failure — push BLOCKED. Fix the issues above."
+        exit 2
+    fi
+
+    if [[ "${auto_fixed}" == "1" ]]; then
+        warn "Auto-fixes applied — push aborted. Stage and commit changes, then push again."
+        exit 1
+    fi
+
+    ok "Gate passed."
+    exit 0
+}
+
+# ── cmd_install: scaffold .gate.conf and hooks in a project ───────────────────
+cmd_install() {
+    local project="${1:-}"
+    [[ -n "${project}" ]] || die "Usage: gate install <projectdir>"
+    [[ -d "${project}" ]] || die "Directory not found: ${project}"
+    project="$(cd "${project}" && pwd)"
+
+    banner "gate install — ${project}"
+
+    # .gate.conf
+    if [[ -f "${project}/.gate.conf" ]]; then
+        ok ".gate.conf already exists — not overwriting"
+    else
+        cp "${GATE_DIR}/.gate.conf.example" "${project}/.gate.conf"
+        fixed "Created ${project}/.gate.conf  (edit to suit your project)"
+    fi
+
+    # .githooks/pre-push
+    mkdir -p "${project}/.githooks"
+    cat > "${project}/.githooks/pre-push" << 'HOOK'
+#!/usr/bin/env bash
+# Auto-installed by push-gate. Do not edit manually.
+# Re-install with: gate install <projectdir>
+set -euo pipefail
+GATE="$(git config --get gate.path 2>/dev/null || echo "")"
+[[ -n "${GATE}" ]] || { echo "push-gate: gate.path not set. Run: gate install <projectdir>"; exit 1; }
+exec "${GATE}/gate" run "$(git rev-parse --show-toplevel)"
+HOOK
+    chmod +x "${project}/.githooks/pre-push"
+    fixed "Created ${project}/.githooks/pre-push"
+
+    # Configure git to use .githooks/ and record gate location
+    git -C "${project}" config core.hooksPath .githooks
+    git -C "${project}" config gate.path "${GATE_DIR}"
+    fixed "Set core.hooksPath = .githooks"
+    fixed "Set gate.path = ${GATE_DIR}"
+
+    echo
+    ok "Done. Commit .gate.conf and .githooks/pre-push, then every 'git push' is gated."
+    echo "  Edit .gate.conf to define your version source, sync targets, and checks."
+}
+
+# ── Dispatch ───────────────────────────────────────────────────────────────────
+CMD="${1:-help}"
+shift || true
+
+case "${CMD}" in
+    check)   cmd_check   "$@" ;;
+    fix)     cmd_fix     "$@" ;;
+    run)     cmd_run     "$@" ;;
+    install) cmd_install "$@" ;;
+    help|--help|-h)
+        sed -n '3,10p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+        ;;
+    *) die "Unknown command '${CMD}'. Use: check | fix | run | install" ;;
+esac
