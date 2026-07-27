@@ -22,15 +22,17 @@ GATE_VERSION_REGEX='^version\s*=\s*"(.+)"'
 # If a line matching the regex is NOT found in the file, gate fix will
 # replace the first line matching the base pattern (VERSION placeholder
 # removed) with the replacement string.
+# Delimiter between file, match, and replacement is '|' (not ':') so that
+# colons in RPM field names (Version:) and TOML values are safe.
 GATE_SYNC=(
     # RPM spec Version: field
-    "home-backup.spec:^Version:[[:space:]]*{VERSION}[[:space:]]*$:Version:        {VERSION}"
+    "home-backup.spec|^Version:[[:space:]]*{VERSION}[[:space:]]*$|Version:        {VERSION}"
 
     # package-rpm.sh VERSION= variable
-    'package-rpm.sh:^VERSION="{VERSION}":VERSION="{VERSION}"'
+    'package-rpm.sh|^VERSION="{VERSION}"|VERSION="{VERSION}"'
 
     # README.md — RPM filename in the installation section
-    'README.md:home-backup-{VERSION}-[0-9]:home-backup-{VERSION}-'
+    'README.md|home-backup-{VERSION}-1\.fc[0-9]|home-backup-{VERSION}-1.fc'
 )
 
 # ── Auto-fix commands ───────────────────────────────────────────────────────

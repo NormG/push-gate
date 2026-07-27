@@ -88,7 +88,8 @@ cmd_check() {
     if [[ ${#GATE_SYNC[@]} -gt 0 ]]; then
         banner "Version sync"
         for entry in "${GATE_SYNC[@]}"; do
-            IFS=':' read -r file match replacement <<< "${entry}"
+            # Delimiter is '|' so colons in RPM/TOML field names are safe.
+            IFS='|' read -r file match replacement <<< "${entry}"
             local filepath="${project}/${file}"
             [[ -f "${filepath}" ]] || { warn "${file}: not found (skipping)"; continue; }
             # Substitute {VERSION} placeholder in replacement
@@ -162,7 +163,7 @@ cmd_fix() {
     if [[ ${#GATE_SYNC[@]} -gt 0 ]]; then
         banner "Version sync"
         for entry in "${GATE_SYNC[@]}"; do
-            IFS=':' read -r file match replacement <<< "${entry}"
+            IFS='|' read -r file match replacement <<< "${entry}"
             local filepath="${project}/${file}"
             [[ -f "${filepath}" ]] || { warn "${file}: not found (skipping)"; continue; }
             local match_v="${match/\{VERSION\}/${version}}"
