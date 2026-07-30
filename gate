@@ -31,6 +31,29 @@ fail()   { printf "${_R}  ✗  ${_X}%s\n"  "$*" >&2; }
 banner() { printf "\n${_B}── %s ──${_X}\n" "$*"; }
 die()    { fail "$*"; exit 1; }
 
+# ── Expand portable escape sequences in regex/config strings ──────────────────
+# Lets .gate.conf authors write '\t' for a tab regardless of how their editor
+# stored the whitespace. Without this, grep -E receives a literal '\t' (which
+# it treats as a literal 't' plus a "stray \ before t" warning), so tab-indented
+# files could never match even when in sync.
+expand_escapes() {
+    printf '%s' "$1" | sed 's/\\t/\t/g'
+}
+
+# Returns 0 if "$1" (a GATE_MUST_PASS command string) is listed in
+# GATE_PASS_ON_EXIT_ONLY — meaning we should ignore its output and judge it
+# purely by exit code. Some legitimate checks (e.g. a build that prints
+# progress) emit output even on success; this lets them pass the gate without
+# forcing the user to wrap them in a silent script.
+pass_on_exit_only() {
+    local cmd="$1"
+    local entry
+    for entry in "${GATE_PASS_ON_EXIT_ONLY[@]:-}"; do
+        [[ "${cmd}" == "${entry}" ]] && return 0
+    done
+    return 1
+}
+
 # ── Locate the project directory and load its config ──────────────────────────
 locate_project() {
     local dir="${1:-$(pwd)}"
@@ -54,6 +77,7 @@ load_config() {
     GATE_SYNC=()
     GATE_AUTO_FIX=()
     GATE_MUST_PASS=()
+    GATE_PASS_ON_EXIT_ONLY=()
     # shellcheck source=/dev/null
     source "${project}/.gate.conf"
     [[ -n "${GATE_VERSION_SOURCE}" ]] \
@@ -67,6 +91,12 @@ read_version() {
     local ver
     ver=$(grep -m1 -E "${GATE_VERSION_REGEX}" "${src}" \
           | sed -E "s/${GATE_VERSION_REGEX}/\1/")
+    # Defensive: an over-greedy capture group (e.g. "(.+)" without an anchored
+    # closing quote) can pull in a trailing quote/comma/space. Strip them so the
+    # extracted version is just the digits/dots.
+    ver="${ver//\"/}"
+    ver="${ver%,}"
+    ver="$(printf '%s' "${ver}" | xargs)"
     [[ -n "${ver}" ]] || die "Could not extract version from ${src}"
     echo "${ver}"
 }
@@ -93,11 +123,12 @@ cmd_check() {
             local filepath="${project}/${file}"
             [[ -f "${filepath}" ]] || { warn "${file}: not found (skipping)"; continue; }
             # Substitute {VERSION} placeholder in replacement
-            local rep="${replacement/\{VERSION\}/${version}}"
-            if grep -qE "${match/\{VERSION\}/${version}}" "${filepath}"; then
+            local rep="$(expand_escapes "${replacement/\{VERSION\}/$version}")"
+            local ver_match="$(expand_escapes "${match/\{VERSION\}/$version}")"
+            if grep -qE "${ver_match}" "${filepath}"; then
                 ok "${file} — in sync"
             else
-                warn "${file} — OUT OF SYNC (expected match: ${match/\{VERSION\}/${version}})"
+                warn "${file} — OUT OF SYNC (expected match: ${ver_match})"
                 any_issue=1
             fi
         done
@@ -130,7 +161,14 @@ cmd_check() {
         cd "${project}"
         for cmd in "${GATE_MUST_PASS[@]}"; do
             local out
-            if out=$(${cmd} 2>&1) && [[ -z "${out}" ]]; then
+            if pass_on_exit_only "${cmd}"; then
+                if ${cmd} >/dev/null 2>&1; then
+                    ok "${cmd}"
+                else
+                    fail "${cmd} — FAILED (exit non-zero)"
+                    any_issue=1
+                fi
+            elif out=$(${cmd} 2>&1) && [[ -z "${out}" ]]; then
                 ok "${cmd}"
             else
                 fail "${cmd} — FAILED"
@@ -166,13 +204,13 @@ cmd_fix() {
             IFS='|' read -r file match replacement <<< "${entry}"
             local filepath="${project}/${file}"
             [[ -f "${filepath}" ]] || { warn "${file}: not found (skipping)"; continue; }
-            local match_v="${match/\{VERSION\}/${version}}"
-            local rep_v="${replacement/\{VERSION\}/${version}}"
+            local match_v="$(expand_escapes "${match/\{VERSION\}/$version}")"
+            local rep_v="$(expand_escapes "${replacement/\{VERSION\}/$version}")"
             if grep -qE "${match_v}" "${filepath}"; then
                 ok "${file} — already in sync"
             else
                 # Apply: replace lines matching the base pattern with the versioned replacement
-                local base_match="${match//\{VERSION\}/[0-9][^ \"]*}"
+                local base_match="$(expand_escapes "${match//\{VERSION\}/[0-9][^ \"]*}")"
                 sed -i -E "s|${base_match}|${rep_v}|" "${filepath}"
                 fixed "${file} — updated"
                 changed=1
@@ -224,7 +262,14 @@ cmd_run() {
         cd "${project}"
         for cmd in "${GATE_MUST_PASS[@]}"; do
             local out
-            if out=$(${cmd} 2>&1) && [[ -z "${out}" ]]; then
+            if pass_on_exit_only "${cmd}"; then
+                if ${cmd} >/dev/null 2>&1; then
+                    ok "${cmd}"
+                else
+                    fail "${cmd} — FAILED (exit non-zero)"
+                    hard_fail=1
+                fi
+            elif out=$(${cmd} 2>&1) && [[ -z "${out}" ]]; then
                 ok "${cmd}"
             else
                 fail "${cmd} — FAILED"

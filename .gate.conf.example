@@ -10,7 +10,7 @@
 GATE_VERSION_SOURCE="Cargo.toml"
 
 # Extended regex used to extract the version (first capture group is the value).
-GATE_VERSION_REGEX='^version\s*=\s*"(.+)"'
+GATE_VERSION_REGEX='^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"'
 
 # ── Version sync targets ────────────────────────────────────────────────────
 # Array of "file:match-regex:replacement" triples.
@@ -50,3 +50,12 @@ GATE_MUST_PASS=(
     "cargo check --quiet"
     "cargo clippy --quiet"
 )
+
+# ── Output-tolerant checks (optional) ─────────────────────────────────────────
+# By default, a GATE_MUST_PASS command must produce NO output. Some legitimate
+# checks (e.g. a build that prints progress, or `npm run dist`) emit output even
+# on success. List such commands here and they are judged purely by exit code
+# (output is discarded). List the EXACT command string as it appears above.
+# GATE_PASS_ON_EXIT_ONLY=(
+#     "npm run dist"
+# )
